@@ -20,3 +20,27 @@ export function getSupabase(): SupabaseClient | null {
 export function publicUrl(path: string): string {
   return `${url}/storage/v1/object/public/${BUCKET}/${path}`;
 }
+
+/** results バケットの全オブジェクトと jobs テーブルの全行を削除する */
+export async function clearAllRemote(): Promise<void> {
+  const sb = getSupabase();
+  if (!sb) return;
+  try {
+    const { data: folders } = await sb.storage
+      .from(BUCKET)
+      .list("", { limit: 1000 });
+    for (const folder of folders ?? []) {
+      const { data: files } = await sb.storage
+        .from(BUCKET)
+        .list(folder.name, { limit: 1000 });
+      if (files && files.length > 0) {
+        await sb.storage
+          .from(BUCKET)
+          .remove(files.map((f) => `${folder.name}/${f.name}`));
+      }
+    }
+    await sb.from("jobs").delete().not("id", "is", null);
+  } catch (e) {
+    console.warn("[clearAllRemote] failed:", e);
+  }
+}

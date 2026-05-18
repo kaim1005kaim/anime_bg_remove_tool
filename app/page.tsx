@@ -13,7 +13,12 @@ import {
 import { runCutout } from "@/lib/cutoutClient";
 import { analyzeImage } from "@/lib/analyzeClient";
 import { downloadZip, triggerDownload, toPngName } from "@/lib/download";
-import { BUCKET, getSupabase, publicUrl } from "@/lib/supabaseClient";
+import {
+  BUCKET,
+  clearAllRemote,
+  getSupabase,
+  publicUrl,
+} from "@/lib/supabaseClient";
 import {
   notificationPermission,
   requestNotificationPermission,
@@ -301,6 +306,8 @@ export default function Home() {
       if (j.resultUrl?.startsWith("blob:")) URL.revokeObjectURL(j.resultUrl);
     });
     setJobs([]);
+    // Supabase に保存済みの結果も削除する(リロードで復活させない)
+    void clearAllRemote();
   }, [jobs]);
 
   const enableNotify = useCallback(async () => {
