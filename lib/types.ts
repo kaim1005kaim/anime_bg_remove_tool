@@ -14,9 +14,17 @@ export interface CutoutOptions {
   tolerance: number;
 }
 
+/** 被写体の正規化バウンディングボックス (各値 0-1) */
+export interface Bbox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface AiAnalysis {
-  /** 被写体の正規化バウンディングボックス (0-1)。失敗時 null */
-  bbox: { x: number; y: number; w: number; h: number } | null;
+  /** 被写体範囲。AI 解析に失敗した場合は null */
+  bbox: Bbox | null;
   /** 背景が一様な白で自動切り抜きに適しているか */
   backgroundOk: boolean;
   /** 日本語の所見 */

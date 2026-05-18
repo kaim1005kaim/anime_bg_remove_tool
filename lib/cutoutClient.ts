@@ -1,4 +1,4 @@
-import type { CutoutOptions } from "./types";
+import type { Bbox, CutoutOptions } from "./types";
 
 export interface CutoutResult {
   blob: Blob;
@@ -47,6 +47,7 @@ function ensurePool(): void {
 export async function runCutout(
   file: File,
   options: CutoutOptions,
+  bbox: Bbox | null,
 ): Promise<CutoutResult> {
   ensurePool();
   const bitmap = await createImageBitmap(file);
@@ -54,6 +55,6 @@ export async function runCutout(
   const worker = pool[roundRobin++ % pool.length];
   return new Promise<CutoutResult>((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    worker.postMessage({ id, bitmap, options }, [bitmap]);
+    worker.postMessage({ id, bitmap, options, bbox }, [bitmap]);
   });
 }

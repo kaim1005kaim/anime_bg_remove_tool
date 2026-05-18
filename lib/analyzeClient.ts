@@ -1,15 +1,11 @@
 import type { AiAnalysis } from "./types";
 
-const FALLBACK: AiAnalysis = {
-  bbox: null,
-  backgroundOk: true,
-  note: "",
-};
+const FALLBACK: AiAnalysis = { bbox: null, backgroundOk: true, note: "" };
 
 /** 解析用に画像を縮小して JPEG data URL を作る (送信ペイロード削減) */
 async function toAnalysisDataUrl(file: File): Promise<string> {
   const bitmap = await createImageBitmap(file);
-  const maxDim = 768;
+  const maxDim = 1024;
   const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
   const w = Math.max(1, Math.round(bitmap.width * scale));
   const h = Math.max(1, Math.round(bitmap.height * scale));
@@ -28,7 +24,7 @@ async function toAnalysisDataUrl(file: File): Promise<string> {
 }
 
 /**
- * Gemini で被写体範囲と背景品質を解析する。
+ * Gemini で被写体範囲(バウンディングボックス)と背景品質を解析する。
  * 失敗しても切り抜き処理を止めないよう、エラー時はフォールバックを返す。
  */
 export async function analyzeImage(file: File): Promise<AiAnalysis> {

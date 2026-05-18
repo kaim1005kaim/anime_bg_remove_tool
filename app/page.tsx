@@ -4,7 +4,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Dropzone from "@/components/Dropzone";
 import SettingsPanel from "@/components/SettingsPanel";
 import ImageCard from "@/components/ImageCard";
-import { DEFAULT_OPTIONS, type CutoutOptions, type Job } from "@/lib/types";
+import {
+  DEFAULT_OPTIONS,
+  type Bbox,
+  type CutoutOptions,
+  type Job,
+} from "@/lib/types";
 import { runCutout } from "@/lib/cutoutClient";
 import { analyzeImage } from "@/lib/analyzeClient";
 import { downloadZip, triggerDownload, toPngName } from "@/lib/download";
@@ -75,9 +80,7 @@ export default function Home() {
         width: (row.width as number) ?? undefined,
         height: (row.height as number) ?? undefined,
         ai: {
-          bbox:
-            (row.ai_bbox as { x: number; y: number; w: number; h: number } | null) ??
-            null,
+          bbox: (row.ai_bbox as Bbox | null) ?? null,
           backgroundOk: (row.ai_background_ok as boolean) ?? true,
           note: (row.ai_note as string) ?? "",
         },
@@ -137,7 +140,7 @@ export default function Home() {
       const ai = await analyzeImage(job.file);
       patch(job.id, { ai, status: "processing" });
       try {
-        const result = await runCutout(job.file, opts);
+        const result = await runCutout(job.file, opts, ai.bbox);
         const resultUrl = URL.createObjectURL(result.blob);
         patch(job.id, {
           status: "done",
@@ -194,7 +197,7 @@ export default function Home() {
     targets.forEach((j) => patch(j.id, { status: "processing" }));
     await runConcurrent(targets, 3, async (job) => {
       try {
-        const result = await runCutout(job.file as File, opts);
+        const result = await runCutout(job.file as File, opts, job.ai?.bbox ?? null);
         const resultUrl = URL.createObjectURL(result.blob);
         patch(job.id, {
           status: "done",

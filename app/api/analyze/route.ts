@@ -3,11 +3,13 @@ import { GoogleGenAI, Type } from "@google/genai";
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
-const PROMPT = `あなたは背景透過処理の前処理アシスタントです。これはアニメ・イラスト調の画像で、白背景の自動切り抜きを行います。
+const PROMPT = `これはアニメ・イラスト調の画像で、白背景の自動切り抜きを行います。
+切り抜いて残したい「被写体」とは、キャラクターと、その絵に含まれる家具や小物(例: 寝ているキャラの下のベッド)です。
+背景の白、UIボタン、アイコン、画面上の文字、手書きの制作マーク等は被写体に含めません。
 次を判定し、指定の JSON スキーマで返してください:
-- box_2d: 主要な被写体(キャラクター等)を囲む最小の矩形。[ymin, xmin, ymax, xmax] の順で 0〜1000 に正規化した整数。
-- background_clean: 背景が一様な白で自動切り抜きに適していれば true、そうでなければ false。
-- note: 切り抜きで問題になりそうな点を日本語で1〜2文。例: 背景が完全な白でない / 被写体が画像端で見切れている / 被写体内部の白が背景と繋がって消える可能性。問題が無ければ「背景は白く良好です。」と返す。`;
+- box_2d: 被写体「全体」をちょうど囲む最小の矩形。[ymin, xmin, ymax, xmax] の順で 0〜1000 に正規化した整数。UIボタンや制作マークは含めないこと。
+- background_clean: 背景が一様な白で自動切り抜きに適していれば true。
+- note: 切り抜きで問題になりそうな点を日本語で1〜2文。問題が無ければ「背景は白く良好です。」と返す。`;
 
 interface GeminiResult {
   box_2d?: number[];
@@ -21,7 +23,6 @@ function clamp01(v: number): number {
 
 export async function POST(request: Request): Promise<Response> {
   const apiKey = process.env.GEMINI_API_KEY;
-  // キー未設定でもアプリを止めない: 解析をスキップした応答を返す
   if (!apiKey) {
     return Response.json({ bbox: null, backgroundOk: true, note: "" });
   }
@@ -38,8 +39,7 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const comma = image.indexOf(",");
-  const meta = image.slice(5, comma);
-  const mimeType = meta.split(";")[0] || "image/jpeg";
+  const mimeType = image.slice(5, comma).split(";")[0] || "image/jpeg";
   const base64 = image.slice(comma + 1);
 
   try {
@@ -99,7 +99,6 @@ export async function POST(request: Request): Promise<Response> {
     });
   } catch (err) {
     console.error("[analyze] Gemini error:", err);
-    // 解析失敗でも切り抜きは続行できるよう 200 でフォールバックを返す
     return Response.json({ bbox: null, backgroundOk: true, note: "" });
   }
 }
