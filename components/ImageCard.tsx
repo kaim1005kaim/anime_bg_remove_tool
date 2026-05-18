@@ -31,8 +31,16 @@ export default function ImageCard({
 
   return (
     <div className="group relative overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900">
-      {/* プレビュー領域 */}
-      <div className="relative aspect-square bg-checker">
+      {/* プレビュー領域 (入力画像のアスペクト比に合わせる) */}
+      <div
+        className="relative bg-checker"
+        style={{
+          aspectRatio:
+            job.width && job.height
+              ? `${job.width} / ${job.height}`
+              : "1 / 1",
+        }}
+      >
         {isDone && job.resultUrl ? (
           <>
             {/* eslint-disable-next-line @next/next/no-img-element */}

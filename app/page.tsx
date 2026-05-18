@@ -170,13 +170,30 @@ export default function Home() {
   const handleFiles = useCallback(
     async (files: File[]) => {
       const opts = optionsRef.current;
-      const newJobs: Job[] = files.map((file) => ({
-        id: crypto.randomUUID(),
-        name: file.name,
-        status: "queued",
-        file,
-        srcUrl: URL.createObjectURL(file),
-      }));
+      const newJobs: Job[] = await Promise.all(
+        files.map(async (file) => {
+          // サムネ枠を入力画像のアスペクト比に合わせるため寸法を先読み
+          let width: number | undefined;
+          let height: number | undefined;
+          try {
+            const bmp = await createImageBitmap(file);
+            width = bmp.width;
+            height = bmp.height;
+            bmp.close();
+          } catch {
+            /* 寸法は任意 */
+          }
+          return {
+            id: crypto.randomUUID(),
+            name: file.name,
+            status: "queued" as const,
+            file,
+            srcUrl: URL.createObjectURL(file),
+            width,
+            height,
+          };
+        }),
+      );
       setJobs((prev) => [...newJobs, ...prev]);
       await runConcurrent(newJobs, 3, (j) => processJob(j, opts));
       sendNotification(
@@ -385,7 +402,7 @@ export default function Home() {
             まだ画像がありません。上のエリアから追加してください。
           </p>
         ) : (
-          <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+          <div className="grid grid-cols-2 items-start gap-4 sm:grid-cols-3 lg:grid-cols-4">
             {jobs.map((job) => (
               <ImageCard
                 key={job.id}
