@@ -1,16 +1,15 @@
 /**
  * 白背景の切り抜きエンジン (Web Worker)。
  *
- * AI バウンディングボックス(被写体範囲)がある場合:
- *  - ボックスの外側は無条件で透過 → UIボタン・文字・制作マーク等を除去。
- *  - 背景除去のフラッドフィルはボックスに進入しない
- *    → 被写体の白(布・肌など)が画像端に接していても消えない。
- *  - ボックス内部の白背景は、画像の内側に面したボックス辺から
- *    フラッドフィルして除去(被写体が接する画像端側の辺は種にしない)。
- * AI ボックスが無い/画像全体に近い場合は、画像4辺からの単純な
- * フラッドフィルにフォールバックする。
+ * 1. 白背景の除去: 画像4辺からのフラッドフィル。AI バウンディングボックス
+ *    (被写体範囲)がある場合、フラッドフィルはボックスに進入しないため、
+ *    被写体の白(布・肌など)が画像端に接していても消えない。ボックス内部の
+ *    白背景は画像の内側に面したボックス辺から別途フラッドフィルして除去する。
+ *    ボックスは保護のヒントであり、被写体がはみ出してもクリップしない。
+ * 2. 連結成分フィルタ: 主要被写体から切り離された小さな塊(UIボタン・
+ *    手書き文字・制作マーク等)を除去する。
+ * 3. 白フチ: 被写体マスクの距離変換で生成。
  *
- * 白フチは被写体マスクの距離変換で生成。
  * 出力は元画像と同じ寸法(アスペクト比を完全維持・トリミングなし)。
  */
 export {};
@@ -138,14 +137,40 @@ async function processImage(
       if (y < h - 1) tryPush(i + w);
     }
   } else {
-    // ボックス外は無条件で透過
-    for (let i = 0; i < N; i++) {
+    // パスA: 画像4辺から白背景をたどる。被写体ボックスには進入しない
+    // (ボックス内の被写体の白が画像端に接していても消さないため)。
+    // ※ボックス外でも非白(=被写体の一部やゴミ)は除去しない。被写体が
+    //   ボックスからはみ出していてもクリップされず、ゴミは後段の連結成分
+    //   フィルタで除去する。
+    const tryPushA = (i: number): void => {
+      if (transparent[i]) return;
       const x = i % w;
       const y = (i - x) / w;
-      if (!inBox(x, y)) transparent[i] = 1;
+      if (inBox(x, y) || minChannel(i) < connectT) return;
+      transparent[i] = 1;
+      stack[sp++] = i;
+    };
+    for (let x = 0; x < w; x++) {
+      tryPushA(x);
+      tryPushA((h - 1) * w + x);
     }
-    // ボックス内: 画像内側に面したボックス辺から白背景をフラッドフィル
-    const tryPush = (i: number): void => {
+    for (let y = 0; y < h; y++) {
+      tryPushA(y * w);
+      tryPushA(y * w + (w - 1));
+    }
+    while (sp > 0) {
+      const i = stack[--sp];
+      const x = i % w;
+      const y = (i - x) / w;
+      if (x > 0) tryPushA(i - 1);
+      if (x < w - 1) tryPushA(i + 1);
+      if (y > 0) tryPushA(i - w);
+      if (y < h - 1) tryPushA(i + w);
+    }
+
+    // パスB: ボックス内の白背景を、画像内側に面したボックス辺からたどる。
+    // 画像端に近いボックス辺は「被写体が端に接している」とみなし種にしない。
+    const tryPushB = (i: number): void => {
       if (transparent[i]) return;
       const x = i % w;
       const y = (i - x) / w;
@@ -153,22 +178,68 @@ async function processImage(
       transparent[i] = 1;
       stack[sp++] = i;
     };
-    // 画像端に近いボックス辺は「被写体が端に接している」とみなし種にしない
-    // (被写体の白が端に接していても消さないため)。
     const marginX = Math.round(w * 0.04);
     const marginY = Math.round(h * 0.04);
-    if (by0 > marginY) for (let x = bx0; x <= bx1; x++) tryPush(by0 * w + x);
-    if (by1 < h - 1 - marginY) for (let x = bx0; x <= bx1; x++) tryPush(by1 * w + x);
-    if (bx0 > marginX) for (let y = by0; y <= by1; y++) tryPush(y * w + bx0);
-    if (bx1 < w - 1 - marginX) for (let y = by0; y <= by1; y++) tryPush(y * w + bx1);
+    if (by0 > marginY) for (let x = bx0; x <= bx1; x++) tryPushB(by0 * w + x);
+    if (by1 < h - 1 - marginY) for (let x = bx0; x <= bx1; x++) tryPushB(by1 * w + x);
+    if (bx0 > marginX) for (let y = by0; y <= by1; y++) tryPushB(y * w + bx0);
+    if (bx1 < w - 1 - marginX) for (let y = by0; y <= by1; y++) tryPushB(y * w + bx1);
     while (sp > 0) {
       const i = stack[--sp];
       const x = i % w;
       const y = (i - x) / w;
-      if (x > 0) tryPush(i - 1);
-      if (x < w - 1) tryPush(i + 1);
-      if (y > 0) tryPush(i - w);
-      if (y < h - 1) tryPush(i + w);
+      if (x > 0) tryPushB(i - 1);
+      if (x < w - 1) tryPushB(i + 1);
+      if (y > 0) tryPushB(i - w);
+      if (y < h - 1) tryPushB(i + w);
+    }
+  }
+
+  // --- 連結成分フィルタ ---
+  // 主要被写体から切り離された小さな塊(手書き文字・制作マーク等)を除去する。
+  {
+    const label = new Int32Array(N).fill(-1);
+    const sizes: number[] = [];
+    let csp = 0;
+    for (let s = 0; s < N; s++) {
+      if (transparent[s] || label[s] !== -1) continue;
+      const compId = sizes.length;
+      let count = 0;
+      label[s] = compId;
+      stack[csp++] = s;
+      while (csp > 0) {
+        const i = stack[--csp];
+        count++;
+        const x = i % w;
+        const y = (i - x) / w;
+        if (x > 0 && !transparent[i - 1] && label[i - 1] === -1) {
+          label[i - 1] = compId;
+          stack[csp++] = i - 1;
+        }
+        if (x < w - 1 && !transparent[i + 1] && label[i + 1] === -1) {
+          label[i + 1] = compId;
+          stack[csp++] = i + 1;
+        }
+        if (y > 0 && !transparent[i - w] && label[i - w] === -1) {
+          label[i - w] = compId;
+          stack[csp++] = i - w;
+        }
+        if (y < h - 1 && !transparent[i + w] && label[i + w] === -1) {
+          label[i + w] = compId;
+          stack[csp++] = i + w;
+        }
+      }
+      sizes.push(count);
+    }
+    if (sizes.length > 1) {
+      let maxSize = 0;
+      for (const sz of sizes) if (sz > maxSize) maxSize = sz;
+      // 最大の被写体の4%未満の孤立塊は切り離されたゴミとみなして除去
+      const keepThreshold = maxSize * 0.04;
+      for (let i = 0; i < N; i++) {
+        const lb = label[i];
+        if (lb >= 0 && sizes[lb] < keepThreshold) transparent[i] = 1;
+      }
     }
   }
 
