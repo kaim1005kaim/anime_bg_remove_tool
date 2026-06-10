@@ -331,6 +331,84 @@ async function processImage(
     }
   }
 
+  // --- 無彩色テンプレート線の除去 ---
+  // フレーム枠・十字・点線ガイド・コーナー罫線は無彩色(黒/グレー)の細い直線で、
+  // 色ベースの除去では消えない。背景(白)の上に乗った細い軸平行の直線だけを対象に
+  // する。被写体の線はピーチ塗り等に接する(両側が白でない)ため除去されない。
+  {
+    const K = Math.max(4, Math.round(Math.min(w, h) * 0.004)); // 線の厚み判定距離
+    const isBg = (x: number, y: number): boolean => {
+      if (x < 0 || y < 0 || x >= w || y >= h) return true;
+      return transparent[y * w + x] === 1;
+    };
+    const lowSat = (i: number): boolean => {
+      const o = i << 2;
+      const r = data[o];
+      const g = data[o + 1];
+      const b = data[o + 2];
+      const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
+      const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
+      return mx - mn < 55; // 無彩色(線画/罫線)
+    };
+    // hCand: 上下が背景の細い横線材料 / vCand: 左右が背景の細い縦線材料
+    const hCand = new Uint8Array(N);
+    const vCand = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      if (transparent[i] || !lowSat(i)) continue;
+      const x = i % w;
+      const y = (i - x) / w;
+      if (isBg(x, y - K) && isBg(x, y + K)) hCand[i] = 1;
+      if (isBg(x - K, y) && isBg(x + K, y)) vCand[i] = 1;
+    }
+    const SPAN_H = w * 0.2;
+    const SPAN_V = h * 0.2;
+    const removeLine = (i: number): void => {
+      transparent[i] = 1;
+    };
+    // 横線: 各行で hCand が幅の20%以上に渡れば、その行±Kの hCand を除去
+    for (let y = 0; y < h; y++) {
+      let minx = w;
+      let maxx = -1;
+      for (let x = 0; x < w; x++) {
+        if (hCand[y * w + x]) {
+          if (x < minx) minx = x;
+          if (x > maxx) maxx = x;
+        }
+      }
+      if (maxx - minx >= SPAN_H) {
+        for (let x = minx; x <= maxx; x++) {
+          for (let dy = -K; dy <= K; dy++) {
+            const yy = y + dy;
+            if (yy < 0 || yy >= h) continue;
+            const j = yy * w + x;
+            if (!transparent[j] && lowSat(j)) removeLine(j);
+          }
+        }
+      }
+    }
+    // 縦線: 各列で vCand が高さの20%以上に渡れば、その列±Kの vCand を除去
+    for (let x = 0; x < w; x++) {
+      let miny = h;
+      let maxy = -1;
+      for (let y = 0; y < h; y++) {
+        if (vCand[y * w + x]) {
+          if (y < miny) miny = y;
+          if (y > maxy) maxy = y;
+        }
+      }
+      if (maxy - miny >= SPAN_V) {
+        for (let y = miny; y <= maxy; y++) {
+          for (let dx = -K; dx <= K; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            const j = y * w + xx;
+            if (!transparent[j] && lowSat(j)) removeLine(j);
+          }
+        }
+      }
+    }
+  }
+
   // --- 連結成分フィルタ ---
   // 主要被写体から切り離された塊(UI枠・ボタン・手書き文字・制作マーク等)を
   // 除去する。AI 被写体ボックスがある場合は「過半数の画素がボックス内」を
