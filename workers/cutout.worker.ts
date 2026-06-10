@@ -66,22 +66,14 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
-// --- 固定テンプレート(ゾーンマスク)の読み込みとキャッシュ ---
-// ゾーンマスク(frame-zones.png)は4色で領域を表す:
-//   白    = キャンバス(描画エリア, 保持)
-//   青    = 枠ボーダー帯(緑枠/黒バーがある。careful: 枠は消すが横切る色付き描画は残す)
-//   ピンク = 外周マージン(確実に削除)
-//   濃赤  = テンプレートのマーク(ボタン/ヘッダー等, 削除)
-const ZONE_CANVAS = 0;
-const ZONE_BORDER = 1;
-const ZONE_DELETE = 2;
-
+// --- 固定テンプレート(キープマスク)の読み込みとキャッシュ ---
+// キープマスク(frame-keep.png)は2値: 白 = 残す描画エリア / それ以外(黒) = 削除(枠/余白)
 interface TemplateMasks {
-  zone: Uint8Array; // 各画素のゾーン(上記定数)
+  keep: Uint8Array; // 1 = 残す(白), 0 = 削除(黒)
   w: number;
   h: number;
 }
-let zonesCanvas: OffscreenCanvas | null = null;
+let keepCanvas: OffscreenCanvas | null = null;
 let templateTried = false;
 const scaledCache = new Map<string, TemplateMasks | null>();
 
@@ -102,21 +94,21 @@ async function fetchToCanvas(url: string): Promise<OffscreenCanvas | null> {
 }
 
 async function loadTemplateAssets(): Promise<boolean> {
-  if (templateTried) return zonesCanvas !== null;
+  if (templateTried) return keepCanvas !== null;
   templateTried = true;
-  zonesCanvas = await fetchToCanvas("/frame-zones.png");
-  return zonesCanvas !== null;
+  keepCanvas = await fetchToCanvas("/frame-keep.png");
+  return keepCanvas !== null;
 }
 
-/** ゾーンマスクを (w,h) にスケールして各画素のゾーンを返す(キャッシュ付き) */
+/** キープマスクを (w,h) にスケールして各画素の keep フラグを返す(キャッシュ付き) */
 async function getTemplateScaled(
   w: number,
   h: number,
 ): Promise<TemplateMasks | null> {
   const ok = await loadTemplateAssets();
-  if (!ok || !zonesCanvas) return null;
+  if (!ok || !keepCanvas) return null;
   // アスペクト比が大きく違う画像はテンプレート対象外
-  const arT = zonesCanvas.width / zonesCanvas.height;
+  const arT = keepCanvas.width / keepCanvas.height;
   const arI = w / h;
   if (Math.abs(arT - arI) / arT > 0.04) return null;
   const key = `${w}x${h}`;
@@ -128,10 +120,10 @@ async function getTemplateScaled(
     scaledCache.set(key, null);
     return null;
   }
-  dc.drawImage(zonesCanvas, 0, 0, w, h);
+  dc.drawImage(keepCanvas, 0, 0, w, h);
   const md = dc.getImageData(0, 0, w, h).data;
   const N = w * h;
-  const zone = new Uint8Array(N);
+  const keep = new Uint8Array(N);
   for (let i = 0; i < N; i++) {
     const o = i << 2;
     const r = md[o];
@@ -140,17 +132,10 @@ async function getTemplateScaled(
     const a = md[o + 3];
     const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
     const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
-    if (a < 40) {
-      zone[i] = ZONE_DELETE; // 透明部分も外周扱い(削除)
-    } else if (mx - mn < 30 && mn > 200) {
-      zone[i] = ZONE_CANVAS; // 白
-    } else if (b > r && b > g && b > 120) {
-      zone[i] = ZONE_BORDER; // 青
-    } else {
-      zone[i] = ZONE_DELETE; // ピンク/濃赤/黒 → 削除
-    }
+    // 白(明るく低彩度) = 残す。それ以外は削除。
+    if (a >= 40 && mx - mn < 40 && mn > 190) keep[i] = 1;
   }
-  const result: TemplateMasks = { zone, w, h };
+  const result: TemplateMasks = { keep, w, h };
   scaledCache.set(key, result);
   return result;
 }
@@ -205,54 +190,33 @@ async function processImage(
   let sp = 0;
   const colorRemoved = new Uint8Array(N);
 
-  // --- 固定テンプレート(ゾーンマスク)の減算 ---
-  // ゾーンマスクで領域を3分類して処理する(肌色に依存せず、被写体が何色でも対応):
-  //   ZONE_DELETE (ピンク/濃赤/外側) → 無条件で全削除(ボタン/ヘッダー/外枠/コーナー)
-  //   ZONE_BORDER (青/枠ボーダー帯)  → 枠(緑/白/無彩色バー)は削除、横切る色付き描画は保持
-  //   ZONE_CANVAS (白/描画エリア)    → 通常処理(緑ガイドは色相除去、白背景はフラッドフィル)
+  // --- 固定テンプレート(キープマスク)の減算 ---
+  // マスクの白い部分(描画エリア)だけ残し、それ以外(枠/十字/ガイド/ボタン/ヘッダー/
+  // 余白/コーナーマーク)は無条件で全削除する。肌色に依存せず被写体が何色でも対応。
+  // その後は通常の背景フラッドフィルが白背景を抜く。
   let templateApplied = false;
   if (template && template.w === w && template.h === h) {
-    const zone = template.zone;
-    // ストーリーボード判定: 青(枠)ゾーンに緑枠が十分あるか(非SB画像への誤適用防止)
-    let borderCount = 0;
-    let greenInBorder = 0;
+    const keep = template.keep;
+    // ストーリーボード判定: 削除領域(マスク黒)に緑枠が十分あるか(非SB画像への誤適用防止)
+    let delCount = 0;
+    let greenInDel = 0;
     for (let i = 0; i < N; i++) {
-      if (zone[i] !== ZONE_BORDER) continue;
-      borderCount++;
+      if (keep[i]) continue;
+      delCount++;
       const o = i << 2;
       const r = data[o];
       const g = data[o + 1];
       const b = data[o + 2];
       const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
-      if (g >= r && g >= b && g - mn > 18) greenInBorder++;
+      if (g >= r && g >= b && g - mn > 18) greenInDel++;
     }
-    const isStoryboard = borderCount > 0 && greenInBorder > borderCount * 0.04;
+    const isStoryboard = delCount > 0 && greenInDel > delCount * 0.04;
 
     if (isStoryboard) {
       for (let i = 0; i < N; i++) {
-        if (transparent[i]) continue;
-        const z = zone[i];
-        if (z === ZONE_DELETE) {
+        if (!keep[i] && !transparent[i]) {
           transparent[i] = 1;
           colorRemoved[i] = 1;
-          continue;
-        }
-        if (z === ZONE_BORDER) {
-          // 枠ボーダー帯: 枠(緑/白/無彩色バー)を削除、色付きの描画は残す
-          const o = i << 2;
-          const r = data[o];
-          const g = data[o + 1];
-          const b = data[o + 2];
-          const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
-          const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
-          const sat = mx - mn;
-          const isGreen = g >= r && g >= b && g - mn > 18;
-          const isNearWhite = mn > 225;
-          const isAchroma = sat < 45; // 無彩色(黒バー/罫線/グレー)
-          if (isGreen || isNearWhite || isAchroma) {
-            transparent[i] = 1;
-            colorRemoved[i] = 1;
-          }
         }
       }
       templateApplied = true;
