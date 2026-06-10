@@ -114,14 +114,16 @@ async function processImage(
   let sp = 0;
 
   // --- テンプレートのアクセントカラー除去 ---
-  // ストーリーボード等の枠・十字・ボタン・ヘッダー文字は同一の彩色(緑/青等)で
-  // 描かれることが多い。AI 被写体ボックスの「外側」から主要な彩色の色相を学習し、
-  // その色相に一致する画素を全面(ボックス内の十字含む)から透過にする。被写体の
-  // 鉛筆線(無彩色)は影響を受けない。学習をボックス外に限定するため、被写体が
-  // 画像端まで色付きで描かれていても(例: 寝具の青)誤って除去しない。
-  // AI ボックスが無い/白背景のみの画像では発動しない。
+  // ストーリーボード等の枠・十字・ボタン・ヘッダー文字は同一の彩色(緑/赤/青等)で
+  // 描かれ、画像の外周に thin な線として存在する。外周リングの彩色画素から色相
+  // ヒストグラムのピークを学習し、その色相に一致する画素を全面(被写体に隣接/交差
+  // する十字含む)から透過にする。
+  // 誤除去防止: 一致画素が画像全体の thin な割合(=枠)のときだけ発動する。被写体が
+  // 画像端まで色付きで大きく描かれている場合(例: 寝具の青)は一致割合が大きいため
+  // 発動しない。被写体の鉛筆線(無彩色)も影響を受けない。被写体ボックスに依存しない
+  // ため、被写体が枠に隣接していても枠を除去できる。
   const colorRemoved = new Uint8Array(N);
-  if (hasBox) {
+  {
     const colorfulness = (o: number): number => {
       const r = data[o];
       const g = data[o + 1];
@@ -148,59 +150,79 @@ async function processImage(
     };
 
     const LEARN_CF = 45; // 学習対象とみなす最小彩度
-    let hvx = 0;
-    let hvy = 0;
-    let learnCount = 0;
-    // AI ボックスの外側のみから彩色を学習する
-    for (let i = 0; i < N; i++) {
-      const x = i % w;
-      const y = (i - x) / w;
-      if (inBox(x, y)) continue;
+    // 外周リング(短辺の約10%)の彩色画素から 36 ビンの色相ヒストグラムを作る
+    const ringT = Math.max(8, Math.round(Math.min(w, h) * 0.1));
+    const BINS = 36;
+    const hist = new Float64Array(BINS);
+    const considerRing = (i: number): void => {
       const o = i << 2;
-      if (data[o + 3] < 8) continue;
-      if (colorfulness(o) < LEARN_CF) continue;
-      const hh = (hueOf(o) * Math.PI) / 180;
-      hvx += Math.cos(hh);
-      hvy += Math.sin(hh);
-      learnCount++;
+      if (data[o + 3] < 8) return;
+      if (colorfulness(o) < LEARN_CF) return;
+      const bin = Math.floor(hueOf(o) / (360 / BINS)) % BINS;
+      hist[bin] += 1;
+    };
+    for (let y = 0; y < h; y++) {
+      const edge = y < ringT || y >= h - ringT;
+      if (edge) {
+        for (let x = 0; x < w; x++) considerRing(y * w + x);
+      } else {
+        for (let x = 0; x < ringT; x++) considerRing(y * w + x);
+        for (let x = w - ringT; x < w; x++) considerRing(y * w + x);
+      }
+    }
+    // ピーク(隣接ビンも合算)を採用
+    let peakBin = -1;
+    let peakVal = 0;
+    for (let b = 0; b < BINS; b++) {
+      const v = hist[b] + hist[(b + 1) % BINS] + hist[(b + BINS - 1) % BINS];
+      if (v > peakVal) {
+        peakVal = v;
+        peakBin = b;
+      }
     }
 
-    // ボックス外に十分な量の一貫した彩色があれば、テンプレート色とみなし全面除去
-    if (learnCount > N * 0.002 && learnCount > 200) {
-      const templH = (((Math.atan2(hvy, hvx) * 180) / Math.PI) % 360 + 360) % 360;
+    if (peakBin >= 0 && peakVal > 200) {
+      const templH = (peakBin + 0.5) * (360 / BINS);
       const MATCH_CF = 24; // 除去対象の最小彩度(縁のアンチエイリアスを拾う)
       const HUE_TOL = 32; // 色相許容
       const colorMask = new Uint8Array(N);
+      let matchCount = 0;
       for (let i = 0; i < N; i++) {
         const o = i << 2;
         if (data[o + 3] < 8) continue;
         if (colorfulness(o) < MATCH_CF) continue;
         let hh = Math.abs(hueOf(o) - templH) % 360;
         if (hh > 180) hh = 360 - hh;
-        if (hh < HUE_TOL) colorMask[i] = 1;
+        if (hh < HUE_TOL) {
+          colorMask[i] = 1;
+          matchCount++;
+        }
       }
-      // アンチエイリアスの薄い縁取りを 1px 膨張して取り切る
-      for (let i = 0; i < N; i++) {
-        if (!colorMask[i]) continue;
-        colorRemoved[i] = 1;
-        transparent[i] = 1;
-        const x = i % w;
-        const y = (i - x) / w;
-        if (x > 0) {
-          colorRemoved[i - 1] = 1;
-          transparent[i - 1] = 1;
-        }
-        if (x < w - 1) {
-          colorRemoved[i + 1] = 1;
-          transparent[i + 1] = 1;
-        }
-        if (y > 0) {
-          colorRemoved[i - w] = 1;
-          transparent[i - w] = 1;
-        }
-        if (y < h - 1) {
-          colorRemoved[i + w] = 1;
-          transparent[i + w] = 1;
+      // 一致画素が thin (画像の15%未満) のときだけ枠とみなして除去する。
+      // 大きな色面(被写体)は除去しない。
+      if (matchCount < N * 0.15) {
+        for (let i = 0; i < N; i++) {
+          if (!colorMask[i]) continue;
+          colorRemoved[i] = 1;
+          transparent[i] = 1;
+          const x = i % w;
+          const y = (i - x) / w;
+          if (x > 0) {
+            colorRemoved[i - 1] = 1;
+            transparent[i - 1] = 1;
+          }
+          if (x < w - 1) {
+            colorRemoved[i + 1] = 1;
+            transparent[i + 1] = 1;
+          }
+          if (y > 0) {
+            colorRemoved[i - w] = 1;
+            transparent[i - w] = 1;
+          }
+          if (y < h - 1) {
+            colorRemoved[i + w] = 1;
+            transparent[i + w] = 1;
+          }
         }
       }
     }
