@@ -6,8 +6,9 @@
  *    被写体の白(布・肌など)が画像端に接していても消えない。ボックス内部の
  *    白背景は画像の内側に面したボックス辺から別途フラッドフィルして除去する。
  *    ボックスは保護のヒントであり、被写体がはみ出してもクリップしない。
- * 2. 連結成分フィルタ: 主要被写体から切り離された小さな塊(UIボタン・
- *    手書き文字・制作マーク等)を除去する。
+ * 2. 連結成分フィルタ: AI 被写体ボックスを基準に、ボックス外に主に分布する
+ *    成分(画像全体に広がる枠線・UIボタン・手書き文字・制作マーク等)を除去
+ *    する。ボックス内に過半数の画素がある成分のみを採用する。
  * 3. 白フチ: 被写体マスクの距離変換で生成。
  *
  * 出力は元画像と同じ寸法(アスペクト比を完全維持・トリミングなし)。
@@ -196,15 +197,19 @@ async function processImage(
   }
 
   // --- 連結成分フィルタ ---
-  // 主要被写体から切り離された小さな塊(手書き文字・制作マーク等)を除去する。
+  // 主要被写体から切り離された塊(UI枠・ボタン・手書き文字・制作マーク等)を
+  // 除去する。AI 被写体ボックスがある場合は「過半数の画素がボックス内」を
+  // 採用基準にし、サイズだけでは判別できない画像全体に広がる枠線も除く。
   {
     const label = new Int32Array(N).fill(-1);
     const sizes: number[] = [];
+    const inBoxCounts: number[] = [];
     let csp = 0;
     for (let s = 0; s < N; s++) {
       if (transparent[s] || label[s] !== -1) continue;
       const compId = sizes.length;
       let count = 0;
+      let inBoxCount = 0;
       label[s] = compId;
       stack[csp++] = s;
       while (csp > 0) {
@@ -212,6 +217,7 @@ async function processImage(
         count++;
         const x = i % w;
         const y = (i - x) / w;
+        if (hasBox && x >= bx0 && x <= bx1 && y >= by0 && y <= by1) inBoxCount++;
         if (x > 0 && !transparent[i - 1] && label[i - 1] === -1) {
           label[i - 1] = compId;
           stack[csp++] = i - 1;
@@ -230,15 +236,36 @@ async function processImage(
         }
       }
       sizes.push(count);
+      inBoxCounts.push(inBoxCount);
     }
-    if (sizes.length > 1) {
-      let maxSize = 0;
-      for (const sz of sizes) if (sz > maxSize) maxSize = sz;
-      // 最大の被写体の4%未満の孤立塊は切り離されたゴミとみなして除去
-      const keepThreshold = maxSize * 0.04;
+
+    if (sizes.length > 0) {
+      const kept = new Uint8Array(sizes.length);
+      let appliedBoxRule = false;
+      if (hasBox) {
+        // 過半数の画素がボックス内にある成分のみを「被写体側」とみなす
+        const inSubject: number[] = [];
+        for (let k = 0; k < sizes.length; k++) {
+          if (inBoxCounts[k] * 2 >= sizes[k]) inSubject.push(k);
+        }
+        if (inSubject.length > 0) {
+          let maxIn = 0;
+          for (const k of inSubject) if (sizes[k] > maxIn) maxIn = sizes[k];
+          const thr = maxIn * 0.04;
+          for (const k of inSubject) if (sizes[k] >= thr) kept[k] = 1;
+          appliedBoxRule = true;
+        }
+      }
+      if (!appliedBoxRule) {
+        // フォールバック: 最大成分の4%以上を保持(AIなし or 被写体側成分なし)
+        let maxSize = 0;
+        for (const sz of sizes) if (sz > maxSize) maxSize = sz;
+        const thr = maxSize * 0.04;
+        for (let k = 0; k < sizes.length; k++) if (sizes[k] >= thr) kept[k] = 1;
+      }
       for (let i = 0; i < N; i++) {
         const lb = label[i];
-        if (lb >= 0 && sizes[lb] < keepThreshold) transparent[i] = 1;
+        if (lb >= 0 && !kept[lb]) transparent[i] = 1;
       }
     }
   }
