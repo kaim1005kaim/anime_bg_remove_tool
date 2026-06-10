@@ -113,6 +113,99 @@ async function processImage(
   const stack = new Int32Array(N);
   let sp = 0;
 
+  // --- テンプレートのアクセントカラー除去 ---
+  // ストーリーボード等の枠・十字・ボタン・ヘッダー文字は同一の彩色(緑/青等)で
+  // 描かれることが多い。AI 被写体ボックスの「外側」から主要な彩色の色相を学習し、
+  // その色相に一致する画素を全面(ボックス内の十字含む)から透過にする。被写体の
+  // 鉛筆線(無彩色)は影響を受けない。学習をボックス外に限定するため、被写体が
+  // 画像端まで色付きで描かれていても(例: 寝具の青)誤って除去しない。
+  // AI ボックスが無い/白背景のみの画像では発動しない。
+  const colorRemoved = new Uint8Array(N);
+  if (hasBox) {
+    const colorfulness = (o: number): number => {
+      const r = data[o];
+      const g = data[o + 1];
+      const b = data[o + 2];
+      const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
+      const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
+      return mx - mn;
+    };
+    // 色相 (0..360)。彩度が低い画素では意味を持たない。
+    const hueOf = (o: number): number => {
+      const r = data[o];
+      const g = data[o + 1];
+      const b = data[o + 2];
+      const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
+      const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
+      const d = mx - mn;
+      if (d === 0) return 0;
+      let hh: number;
+      if (mx === r) hh = ((g - b) / d) % 6;
+      else if (mx === g) hh = (b - r) / d + 2;
+      else hh = (r - g) / d + 4;
+      hh *= 60;
+      return hh < 0 ? hh + 360 : hh;
+    };
+
+    const LEARN_CF = 45; // 学習対象とみなす最小彩度
+    let hvx = 0;
+    let hvy = 0;
+    let learnCount = 0;
+    // AI ボックスの外側のみから彩色を学習する
+    for (let i = 0; i < N; i++) {
+      const x = i % w;
+      const y = (i - x) / w;
+      if (inBox(x, y)) continue;
+      const o = i << 2;
+      if (data[o + 3] < 8) continue;
+      if (colorfulness(o) < LEARN_CF) continue;
+      const hh = (hueOf(o) * Math.PI) / 180;
+      hvx += Math.cos(hh);
+      hvy += Math.sin(hh);
+      learnCount++;
+    }
+
+    // ボックス外に十分な量の一貫した彩色があれば、テンプレート色とみなし全面除去
+    if (learnCount > N * 0.002 && learnCount > 200) {
+      const templH = (((Math.atan2(hvy, hvx) * 180) / Math.PI) % 360 + 360) % 360;
+      const MATCH_CF = 24; // 除去対象の最小彩度(縁のアンチエイリアスを拾う)
+      const HUE_TOL = 32; // 色相許容
+      const colorMask = new Uint8Array(N);
+      for (let i = 0; i < N; i++) {
+        const o = i << 2;
+        if (data[o + 3] < 8) continue;
+        if (colorfulness(o) < MATCH_CF) continue;
+        let hh = Math.abs(hueOf(o) - templH) % 360;
+        if (hh > 180) hh = 360 - hh;
+        if (hh < HUE_TOL) colorMask[i] = 1;
+      }
+      // アンチエイリアスの薄い縁取りを 1px 膨張して取り切る
+      for (let i = 0; i < N; i++) {
+        if (!colorMask[i]) continue;
+        colorRemoved[i] = 1;
+        transparent[i] = 1;
+        const x = i % w;
+        const y = (i - x) / w;
+        if (x > 0) {
+          colorRemoved[i - 1] = 1;
+          transparent[i - 1] = 1;
+        }
+        if (x < w - 1) {
+          colorRemoved[i + 1] = 1;
+          transparent[i + 1] = 1;
+        }
+        if (y > 0) {
+          colorRemoved[i - w] = 1;
+          transparent[i - w] = 1;
+        }
+        if (y < h - 1) {
+          colorRemoved[i + w] = 1;
+          transparent[i + w] = 1;
+        }
+      }
+    }
+  }
+
   if (!hasBox) {
     // フォールバック: 画像4辺から白っぽい連結領域を透過に
     const tryPush = (i: number): void => {
@@ -127,6 +220,16 @@ async function processImage(
     for (let y = 0; y < h; y++) {
       tryPush(y * w);
       tryPush(y * w + (w - 1));
+    }
+    // 除去された枠の内側に閉じ込められた白も背景として除去する
+    for (let i = 0; i < N; i++) {
+      if (!colorRemoved[i]) continue;
+      const x = i % w;
+      const y = (i - x) / w;
+      if (x > 0) tryPush(i - 1);
+      if (x < w - 1) tryPush(i + 1);
+      if (y > 0) tryPush(i - w);
+      if (y < h - 1) tryPush(i + w);
     }
     while (sp > 0) {
       const i = stack[--sp];
@@ -158,6 +261,16 @@ async function processImage(
     for (let y = 0; y < h; y++) {
       tryPushA(y * w);
       tryPushA(y * w + (w - 1));
+    }
+    // 除去された枠の内側(ボックス外)に閉じ込められた白も背景として除去する
+    for (let i = 0; i < N; i++) {
+      if (!colorRemoved[i]) continue;
+      const x = i % w;
+      const y = (i - x) / w;
+      if (x > 0) tryPushA(i - 1);
+      if (x < w - 1) tryPushA(i + 1);
+      if (y > 0) tryPushA(i - w);
+      if (y < h - 1) tryPushA(i + w);
     }
     while (sp > 0) {
       const i = stack[--sp];
