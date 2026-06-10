@@ -43,7 +43,8 @@ const ctx = self as unknown as {
 ctx.onmessage = async (e: MessageEvent<InMsg>) => {
   const { id, bitmap, options, bbox } = e.data;
   try {
-    const result = await processImage(bitmap, options, bbox);
+    const template = await getTemplateScaled(bitmap.width, bitmap.height);
+    const result = await processImage(bitmap, options, bbox, template);
     bitmap.close();
     ctx.postMessage({
       id,
@@ -65,10 +66,100 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+// --- 固定テンプレート(ゾーンマスク)の読み込みとキャッシュ ---
+// ゾーンマスク(frame-zones.png)は4色で領域を表す:
+//   白    = キャンバス(描画エリア, 保持)
+//   青    = 枠ボーダー帯(緑枠/黒バーがある。careful: 枠は消すが横切る色付き描画は残す)
+//   ピンク = 外周マージン(確実に削除)
+//   濃赤  = テンプレートのマーク(ボタン/ヘッダー等, 削除)
+const ZONE_CANVAS = 0;
+const ZONE_BORDER = 1;
+const ZONE_DELETE = 2;
+
+interface TemplateMasks {
+  zone: Uint8Array; // 各画素のゾーン(上記定数)
+  w: number;
+  h: number;
+}
+let zonesCanvas: OffscreenCanvas | null = null;
+let templateTried = false;
+const scaledCache = new Map<string, TemplateMasks | null>();
+
+async function fetchToCanvas(url: string): Promise<OffscreenCanvas | null> {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const bmp = await createImageBitmap(await resp.blob());
+    const c = new OffscreenCanvas(bmp.width, bmp.height);
+    const cx = c.getContext("2d");
+    if (!cx) return null;
+    cx.drawImage(bmp, 0, 0);
+    bmp.close();
+    return c;
+  } catch {
+    return null;
+  }
+}
+
+async function loadTemplateAssets(): Promise<boolean> {
+  if (templateTried) return zonesCanvas !== null;
+  templateTried = true;
+  zonesCanvas = await fetchToCanvas("/frame-zones.png");
+  return zonesCanvas !== null;
+}
+
+/** ゾーンマスクを (w,h) にスケールして各画素のゾーンを返す(キャッシュ付き) */
+async function getTemplateScaled(
+  w: number,
+  h: number,
+): Promise<TemplateMasks | null> {
+  const ok = await loadTemplateAssets();
+  if (!ok || !zonesCanvas) return null;
+  // アスペクト比が大きく違う画像はテンプレート対象外
+  const arT = zonesCanvas.width / zonesCanvas.height;
+  const arI = w / h;
+  if (Math.abs(arT - arI) / arT > 0.04) return null;
+  const key = `${w}x${h}`;
+  if (scaledCache.has(key)) return scaledCache.get(key) ?? null;
+
+  const d = new OffscreenCanvas(w, h);
+  const dc = d.getContext("2d", { willReadFrequently: true });
+  if (!dc) {
+    scaledCache.set(key, null);
+    return null;
+  }
+  dc.drawImage(zonesCanvas, 0, 0, w, h);
+  const md = dc.getImageData(0, 0, w, h).data;
+  const N = w * h;
+  const zone = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    const o = i << 2;
+    const r = md[o];
+    const g = md[o + 1];
+    const b = md[o + 2];
+    const a = md[o + 3];
+    const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
+    const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
+    if (a < 40) {
+      zone[i] = ZONE_DELETE; // 透明部分も外周扱い(削除)
+    } else if (mx - mn < 30 && mn > 200) {
+      zone[i] = ZONE_CANVAS; // 白
+    } else if (b > r && b > g && b > 120) {
+      zone[i] = ZONE_BORDER; // 青
+    } else {
+      zone[i] = ZONE_DELETE; // ピンク/濃赤/黒 → 削除
+    }
+  }
+  const result: TemplateMasks = { zone, w, h };
+  scaledCache.set(key, result);
+  return result;
+}
+
 async function processImage(
   bitmap: ImageBitmap,
   options: CutoutOptions,
   bbox: Bbox | null,
+  template: TemplateMasks | null,
 ) {
   const w = bitmap.width;
   const h = bitmap.height;
@@ -112,6 +203,61 @@ async function processImage(
   const transparent = new Uint8Array(N);
   const stack = new Int32Array(N);
   let sp = 0;
+  const colorRemoved = new Uint8Array(N);
+
+  // --- 固定テンプレート(ゾーンマスク)の減算 ---
+  // ゾーンマスクで領域を3分類して処理する(肌色に依存せず、被写体が何色でも対応):
+  //   ZONE_DELETE (ピンク/濃赤/外側) → 無条件で全削除(ボタン/ヘッダー/外枠/コーナー)
+  //   ZONE_BORDER (青/枠ボーダー帯)  → 枠(緑/白/無彩色バー)は削除、横切る色付き描画は保持
+  //   ZONE_CANVAS (白/描画エリア)    → 通常処理(緑ガイドは色相除去、白背景はフラッドフィル)
+  let templateApplied = false;
+  if (template && template.w === w && template.h === h) {
+    const zone = template.zone;
+    // ストーリーボード判定: 青(枠)ゾーンに緑枠が十分あるか(非SB画像への誤適用防止)
+    let borderCount = 0;
+    let greenInBorder = 0;
+    for (let i = 0; i < N; i++) {
+      if (zone[i] !== ZONE_BORDER) continue;
+      borderCount++;
+      const o = i << 2;
+      const r = data[o];
+      const g = data[o + 1];
+      const b = data[o + 2];
+      const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
+      if (g >= r && g >= b && g - mn > 18) greenInBorder++;
+    }
+    const isStoryboard = borderCount > 0 && greenInBorder > borderCount * 0.04;
+
+    if (isStoryboard) {
+      for (let i = 0; i < N; i++) {
+        if (transparent[i]) continue;
+        const z = zone[i];
+        if (z === ZONE_DELETE) {
+          transparent[i] = 1;
+          colorRemoved[i] = 1;
+          continue;
+        }
+        if (z === ZONE_BORDER) {
+          // 枠ボーダー帯: 枠(緑/白/無彩色バー)を削除、色付きの描画は残す
+          const o = i << 2;
+          const r = data[o];
+          const g = data[o + 1];
+          const b = data[o + 2];
+          const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
+          const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
+          const sat = mx - mn;
+          const isGreen = g >= r && g >= b && g - mn > 18;
+          const isNearWhite = mn > 225;
+          const isAchroma = sat < 45; // 無彩色(黒バー/罫線/グレー)
+          if (isGreen || isNearWhite || isAchroma) {
+            transparent[i] = 1;
+            colorRemoved[i] = 1;
+          }
+        }
+      }
+      templateApplied = true;
+    }
+  }
 
   // --- テンプレートのアクセントカラー除去 ---
   // ストーリーボード等の枠・十字・ボタン・ヘッダー文字は同一の彩色(緑/赤/青等)で
@@ -122,8 +268,9 @@ async function processImage(
   // 画像端まで色付きで大きく描かれている場合(例: 寝具の青)は一致割合が大きいため
   // 発動しない。被写体の鉛筆線(無彩色)も影響を受けない。被写体ボックスに依存しない
   // ため、被写体が枠に隣接していても枠を除去できる。
-  const colorRemoved = new Uint8Array(N);
+  // テンプレート減算がマスクのズレで取りこぼした枠も、ここで色相から補完除去する。
   {
+    void templateApplied;
     const colorfulness = (o: number): number => {
       const r = data[o];
       const g = data[o + 1];
@@ -331,84 +478,6 @@ async function processImage(
     }
   }
 
-  // --- 無彩色テンプレート線の除去 ---
-  // フレーム枠・十字・点線ガイド・コーナー罫線は無彩色(黒/グレー)の細い直線で、
-  // 色ベースの除去では消えない。背景(白)の上に乗った細い軸平行の直線だけを対象に
-  // する。被写体の線はピーチ塗り等に接する(両側が白でない)ため除去されない。
-  {
-    const K = Math.max(4, Math.round(Math.min(w, h) * 0.004)); // 線の厚み判定距離
-    const isBg = (x: number, y: number): boolean => {
-      if (x < 0 || y < 0 || x >= w || y >= h) return true;
-      return transparent[y * w + x] === 1;
-    };
-    const lowSat = (i: number): boolean => {
-      const o = i << 2;
-      const r = data[o];
-      const g = data[o + 1];
-      const b = data[o + 2];
-      const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
-      const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
-      return mx - mn < 55; // 無彩色(線画/罫線)
-    };
-    // hCand: 上下が背景の細い横線材料 / vCand: 左右が背景の細い縦線材料
-    const hCand = new Uint8Array(N);
-    const vCand = new Uint8Array(N);
-    for (let i = 0; i < N; i++) {
-      if (transparent[i] || !lowSat(i)) continue;
-      const x = i % w;
-      const y = (i - x) / w;
-      if (isBg(x, y - K) && isBg(x, y + K)) hCand[i] = 1;
-      if (isBg(x - K, y) && isBg(x + K, y)) vCand[i] = 1;
-    }
-    const SPAN_H = w * 0.2;
-    const SPAN_V = h * 0.2;
-    const removeLine = (i: number): void => {
-      transparent[i] = 1;
-    };
-    // 横線: 各行で hCand が幅の20%以上に渡れば、その行±Kの hCand を除去
-    for (let y = 0; y < h; y++) {
-      let minx = w;
-      let maxx = -1;
-      for (let x = 0; x < w; x++) {
-        if (hCand[y * w + x]) {
-          if (x < minx) minx = x;
-          if (x > maxx) maxx = x;
-        }
-      }
-      if (maxx - minx >= SPAN_H) {
-        for (let x = minx; x <= maxx; x++) {
-          for (let dy = -K; dy <= K; dy++) {
-            const yy = y + dy;
-            if (yy < 0 || yy >= h) continue;
-            const j = yy * w + x;
-            if (!transparent[j] && lowSat(j)) removeLine(j);
-          }
-        }
-      }
-    }
-    // 縦線: 各列で vCand が高さの20%以上に渡れば、その列±Kの vCand を除去
-    for (let x = 0; x < w; x++) {
-      let miny = h;
-      let maxy = -1;
-      for (let y = 0; y < h; y++) {
-        if (vCand[y * w + x]) {
-          if (y < miny) miny = y;
-          if (y > maxy) maxy = y;
-        }
-      }
-      if (maxy - miny >= SPAN_V) {
-        for (let y = miny; y <= maxy; y++) {
-          for (let dx = -K; dx <= K; dx++) {
-            const xx = x + dx;
-            if (xx < 0 || xx >= w) continue;
-            const j = y * w + xx;
-            if (!transparent[j] && lowSat(j)) removeLine(j);
-          }
-        }
-      }
-    }
-  }
-
   // --- 連結成分フィルタ ---
   // 主要被写体から切り離された塊(UI枠・ボタン・手書き文字・制作マーク等)を
   // 除去する。AI 被写体ボックスがある場合は「過半数の画素がボックス内」を
@@ -454,27 +523,25 @@ async function processImage(
 
     if (sizes.length > 0) {
       const kept = new Uint8Array(sizes.length);
-      let appliedBoxRule = false;
-      if (hasBox) {
-        // 過半数の画素がボックス内にある成分のみを「被写体側」とみなす
-        const inSubject: number[] = [];
-        for (let k = 0; k < sizes.length; k++) {
-          if (inBoxCounts[k] * 2 >= sizes[k]) inSubject.push(k);
+      let globalMax = 0;
+      for (const sz of sizes) if (sz > globalMax) globalMax = sz;
+      // 方針:
+      //  - 最大成分の15%以上の大きな成分(=主要被写体, 複数可)は AI ボックスに
+      //    関わらず常に保持する。AI ボックスが誤っても被写体を失わない。
+      //  - 4〜15% の中程度の成分は、大半がボックス外なら除去(箱外の注釈/ゴミ)。
+      //  - 4%未満の小さな成分は除去(ノイズ・細かいマーク)。
+      for (let k = 0; k < sizes.length; k++) {
+        const big = sizes[k] >= globalMax * 0.15;
+        let keep = sizes[k] >= globalMax * 0.04;
+        if (
+          keep &&
+          !big &&
+          hasBox &&
+          inBoxCounts[k] * 2 < sizes[k]
+        ) {
+          keep = false;
         }
-        if (inSubject.length > 0) {
-          let maxIn = 0;
-          for (const k of inSubject) if (sizes[k] > maxIn) maxIn = sizes[k];
-          const thr = maxIn * 0.04;
-          for (const k of inSubject) if (sizes[k] >= thr) kept[k] = 1;
-          appliedBoxRule = true;
-        }
-      }
-      if (!appliedBoxRule) {
-        // フォールバック: 最大成分の4%以上を保持(AIなし or 被写体側成分なし)
-        let maxSize = 0;
-        for (const sz of sizes) if (sz > maxSize) maxSize = sz;
-        const thr = maxSize * 0.04;
-        for (let k = 0; k < sizes.length; k++) if (sizes[k] >= thr) kept[k] = 1;
+        if (keep) kept[k] = 1;
       }
       for (let i = 0; i < N; i++) {
         const lb = label[i];
