@@ -339,8 +339,10 @@ async function processImage(
     }
   }
 
-  if (!hasBox) {
-    // フォールバック: 画像4辺から白っぽい連結領域を透過に
+  if (!hasBox || templateApplied) {
+    // 全面フラッドフィル(ボックス保護なし)。テンプレート適用時は、削除済みの枠境界
+    // (colorRemoved)からキャンバス内の白背景まで連結して除去する。被写体に囲まれた
+    // 内部の白は連結しないため残る。
     const tryPush = (i: number): void => {
       if (transparent[i] || minChannel(i) < connectT) return;
       transparent[i] = 1;
